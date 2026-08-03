@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -35,13 +36,16 @@ internal static class Program
                 stop.Set();
             };
 
-            Console.WriteLine($"{AppName} 1.0.0");
+            Console.WriteLine($"{AppName} 1.1.0");
             Console.WriteLine($"Config: {Path.GetFullPath(configPath)}");
             Console.WriteLine($"Log:    {settings.ResolveLogPath()}");
             Console.WriteLine("Press Ctrl+C to stop.");
             logger.Info($"Started. threshold={settings.CpuThresholdPercent:F1}%, duration={settings.LowCpuDurationSeconds}s, interval={settings.CheckIntervalSeconds}s, fallback={settings.Fallback}");
 
             var sampler = new CpuSampler();
+            using CpuFloorController? cpuFloor = settings.Fallback == FallbackMode.CpuFloor
+                ? new CpuFloorController(settings.CpuThresholdPercent, logger)
+                : null;
             DateTimeOffset? lowSince = null;
 
             while (!stop.Wait(TimeSpan.FromSeconds(settings.CheckIntervalSeconds)))
@@ -57,6 +61,7 @@ internal static class Program
                 if (double.IsNaN(cpuPercent))
                     continue;
 
+                cpuFloor?.Update(cpuPercent);
                 DateTimeOffset now = DateTimeOffset.Now;
                 if (cpuPercent < settings.CpuThresholdPercent)
                 {
@@ -64,7 +69,7 @@ internal static class Program
                     TimeSpan lowFor = now - lowSince.Value;
                     if (lowFor.TotalSeconds >= settings.LowCpuDurationSeconds)
                     {
-                        PerformKeepAlive(settings, logger, cpuPercent, lowFor);
+                        PerformKeepAlive(settings, logger, cpuFloor, cpuPercent, lowFor);
                         lowSince = now;
                     }
                 }
@@ -89,7 +94,7 @@ internal static class Program
         }
     }
 
-    private static void PerformKeepAlive(GuardSettings settings, FileLogger logger, double cpuPercent, TimeSpan lowFor)
+    private static void PerformKeepAlive(GuardSettings settings, FileLogger logger, CpuFloorController? cpuFloor, double cpuPercent, TimeSpan lowFor)
     {
         bool executionStateOk = NativeMethods.SetThreadExecutionState(
             NativeMethods.ExecutionState.SystemRequired |
@@ -101,14 +106,17 @@ internal static class Program
             FallbackMode.None => true,
             FallbackMode.ScrollLock => NativeMethods.ToggleScrollLockTwice(),
             FallbackMode.MousePixel => NativeMethods.NudgeMouseOnePixel(),
+            FallbackMode.CpuFloor => cpuFloor?.Activate() == true,
             _ => false
         };
-        int fallbackError = fallbackOk ? 0 : Marshal.GetLastWin32Error();
+        int fallbackError = fallbackOk || settings.Fallback == FallbackMode.CpuFloor ? 0 : Marshal.GetLastWin32Error();
 
         string executionStateResult = executionStateOk ? "ok" : $"failed (Win32 error={executionStateError})";
         string fallbackResult = settings.Fallback == FallbackMode.None
             ? "disabled"
-            : fallbackOk ? "ok" : $"failed (Win32 error={fallbackError})";
+            : fallbackOk ? "ok" : settings.Fallback == FallbackMode.CpuFloor
+                ? "failed (see previous log entry)"
+                : $"failed (Win32 error={fallbackError})";
         string message = $"Keep-alive attempted after CPU stayed below threshold for {lowFor.TotalSeconds:F0}s (CPU={cpuPercent:F1}%). SetThreadExecutionState={executionStateResult}, fallback={settings.Fallback}:{fallbackResult}.";
         if (executionStateOk && fallbackOk)
             logger.Info(message);
@@ -142,7 +150,8 @@ internal enum FallbackMode
 {
     None,
     ScrollLock,
-    MousePixel
+    MousePixel,
+    CpuFloor
 }
 
 internal sealed class GuardSettings
@@ -190,7 +199,118 @@ internal sealed class GuardSettings
         if (string.IsNullOrWhiteSpace(LogFile))
             throw new InvalidDataException("LogFile must not be empty.");
         if (!Enum.IsDefined(Fallback))
-            throw new InvalidDataException("Fallback must be None, ScrollLock, or MousePixel.");
+            throw new InvalidDataException("Fallback must be None, ScrollLock, MousePixel, or CpuFloor.");
+        if (Fallback == FallbackMode.CpuFloor && CpuThresholdPercent is < 1 or > 25)
+            throw new InvalidDataException("CpuThresholdPercent must be between 1 and 25 when Fallback is CpuFloor.");
+    }
+}
+
+internal sealed class CpuFloorController : IDisposable
+{
+    private const int MaxWorkers = 32;
+    private const double MaxWorkerDuty = 0.50;
+    private const int WindowMilliseconds = 100;
+    private readonly double _targetPercent;
+    private readonly FileLogger _logger;
+    private readonly ManualResetEventSlim _stop = new(false);
+    private readonly Thread[] _workers;
+    private double _desiredDuty;
+    private int _active;
+    private DateTimeOffset _nextStatusLog = DateTimeOffset.MinValue;
+
+    public CpuFloorController(double targetPercent, FileLogger logger)
+    {
+        _targetPercent = targetPercent;
+        _logger = logger;
+        int workerCount = Math.Min(Environment.ProcessorCount, MaxWorkers);
+        _workers = Enumerable.Range(1, workerCount).Select(index => new Thread(WorkerLoop)
+        {
+            IsBackground = true,
+            Name = $"VmSessionGuard.CpuFloor.{index}",
+            Priority = ThreadPriority.BelowNormal
+        }).ToArray();
+    }
+
+    public bool Activate()
+    {
+        if (Interlocked.CompareExchange(ref _active, 1, 0) != 0)
+            return true;
+
+        try
+        {
+            double initialDuty = Math.Clamp(
+                (_targetPercent / 100.0) * Environment.ProcessorCount / _workers.Length,
+                0.0,
+                MaxWorkerDuty);
+            Volatile.Write(ref _desiredDuty, initialDuty);
+            foreach (Thread worker in _workers)
+                worker.Start();
+
+            double maximumSystemContribution = 100.0 * _workers.Length * MaxWorkerDuty / Environment.ProcessorCount;
+            _logger.Warn($"CPU floor activated with {_workers.Length} below-normal-priority workers. target={_targetPercent:F1}%, initial worker duty={initialDuty * 100:F1}%, safety ceiling contribution={maximumSystemContribution:F1}%.");
+            if (maximumSystemContribution < _targetPercent)
+                _logger.Warn($"CPU floor target may be unreachable on this {Environment.ProcessorCount}-processor VM because of the safety ceiling.");
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _logger.Error($"Could not activate CPU floor: {ex.Message}");
+            _stop.Set();
+            return false;
+        }
+    }
+
+    public void Update(double measuredCpuPercent)
+    {
+        if (Volatile.Read(ref _active) == 0)
+            return;
+
+        double currentDuty = Volatile.Read(ref _desiredDuty);
+        double processorScale = (double)Environment.ProcessorCount / _workers.Length;
+        double adjustment = 0.65 * ((_targetPercent - measuredCpuPercent) / 100.0) * processorScale;
+        double nextDuty = Math.Clamp(currentDuty + adjustment, 0.0, MaxWorkerDuty);
+        Volatile.Write(ref _desiredDuty, nextDuty);
+
+        DateTimeOffset now = DateTimeOffset.Now;
+        if (now >= _nextStatusLog)
+        {
+            _logger.Info($"CPU floor status: measured={measuredCpuPercent:F1}%, target={_targetPercent:F1}%, worker duty={nextDuty * 100:F1}%.");
+            _nextStatusLog = now.AddMinutes(1);
+        }
+    }
+
+    private void WorkerLoop()
+    {
+        var stopwatch = new Stopwatch();
+        while (!_stop.IsSet)
+        {
+            double duty = Volatile.Read(ref _desiredDuty);
+            if (duty <= 0.0005)
+            {
+                _stop.Wait(WindowMilliseconds);
+                continue;
+            }
+
+            double activeMilliseconds = WindowMilliseconds * duty;
+            stopwatch.Restart();
+            while (stopwatch.Elapsed.TotalMilliseconds < activeMilliseconds && !_stop.IsSet)
+                Thread.SpinWait(256);
+
+            int remainingMilliseconds = Math.Max(0, WindowMilliseconds - (int)stopwatch.Elapsed.TotalMilliseconds);
+            if (remainingMilliseconds > 0)
+                _stop.Wait(remainingMilliseconds);
+        }
+    }
+
+    public void Dispose()
+    {
+        _stop.Set();
+        foreach (Thread worker in _workers)
+        {
+            if (worker.IsAlive)
+                worker.Join(TimeSpan.FromSeconds(2));
+        }
+        _stop.Dispose();
     }
 }
 
