@@ -9,7 +9,7 @@ namespace VmSessionGuard;
 internal static class Program
 {
     private const string AppName = "VM Session Guard";
-    private const string AppVersion = "1.2.0";
+    private const string AppVersion = "1.3.0";
 
     private static int Main(string[] args)
     {
@@ -29,6 +29,7 @@ internal static class Program
         {
             string configPath = GetConfigPath(args);
             GuardSettings settings = GuardSettings.Load(configPath);
+            IReadOnlyList<FallbackMode> fallbackModes = settings.GetFallbackModes();
             DateTimeOffset startedAt = DateTimeOffset.Now;
             string logPath = settings.ResolveLogPath(startedAt);
             using var logger = new FileLogger(logPath);
@@ -44,12 +45,12 @@ internal static class Program
             Console.WriteLine($"Config: {Path.GetFullPath(configPath)}");
             Console.WriteLine($"Log:    {logPath}");
             Console.WriteLine("Press Ctrl+C to stop.");
-            logger.Info($"Started. threshold={settings.CpuThresholdPercent:F1}%, duration={settings.LowCpuDurationSeconds}s, interval={settings.CheckIntervalSeconds}s, fallback={settings.Fallback}");
-            if (settings.Fallback == FallbackMode.None)
+            logger.Info($"Started. threshold={settings.CpuThresholdPercent:F1}%, duration={settings.LowCpuDurationSeconds}s, interval={settings.CheckIntervalSeconds}s, fallbacks={string.Join(",", fallbackModes)}");
+            if (fallbackModes.Contains(FallbackMode.None))
                 logger.Warn("Fallback=None only refreshes the local Windows execution state; VM/VDI server-side idle policies may still classify this session as idle. Use an approved input fallback such as MousePixel or ScrollLock.");
 
             var sampler = new CpuSampler();
-            using CpuFloorController? cpuFloor = settings.Fallback == FallbackMode.CpuFloor
+            using CpuFloorController? cpuFloor = fallbackModes.Contains(FallbackMode.CpuFloor)
                 ? new CpuFloorController(settings.CpuThresholdPercent, logger)
                 : null;
             DateTimeOffset? lowSince = null;
@@ -75,7 +76,7 @@ internal static class Program
                     TimeSpan lowFor = now - lowSince.Value;
                     if (lowFor.TotalSeconds >= settings.LowCpuDurationSeconds)
                     {
-                        PerformKeepAlive(settings, logger, cpuFloor, cpuPercent, lowFor);
+                        PerformKeepAlive(fallbackModes, logger, cpuFloor, cpuPercent, lowFor);
                         lowSince = now;
                     }
                 }
@@ -100,37 +101,63 @@ internal static class Program
         }
     }
 
-    private static void PerformKeepAlive(GuardSettings settings, FileLogger logger, CpuFloorController? cpuFloor, double cpuPercent, TimeSpan lowFor)
+    private static void PerformKeepAlive(
+        IReadOnlyList<FallbackMode> fallbackModes,
+        FileLogger logger,
+        CpuFloorController? cpuFloor,
+        double cpuPercent,
+        TimeSpan lowFor)
     {
         bool executionStateOk = NativeMethods.SetThreadExecutionState(
             NativeMethods.ExecutionState.SystemRequired |
             NativeMethods.ExecutionState.DisplayRequired) != 0;
         int executionStateError = executionStateOk ? 0 : Marshal.GetLastWin32Error();
-        TimeSpan? localInputIdleBefore = NativeMethods.TryGetLastInputIdle(out int inputBeforeError);
+        bool hasInputFallback = fallbackModes.Any(mode => mode is FallbackMode.ScrollLock or FallbackMode.MousePixel);
+        int inputBeforeError = 0;
+        TimeSpan? localInputIdleBefore = hasInputFallback
+            ? NativeMethods.TryGetLastInputIdle(out inputBeforeError)
+            : null;
+        var fallbackResults = new List<string>(fallbackModes.Count);
+        bool fallbackOk = true;
 
-        bool fallbackOk = settings.Fallback switch
+        foreach (FallbackMode fallback in fallbackModes)
         {
-            FallbackMode.None => true,
-            FallbackMode.ScrollLock => NativeMethods.ToggleScrollLockTwice(),
-            FallbackMode.MousePixel => NativeMethods.NudgeMouseOnePixel(),
-            FallbackMode.CpuFloor => cpuFloor?.Activate() == true,
-            _ => false
-        };
-        int fallbackError = fallbackOk || settings.Fallback == FallbackMode.CpuFloor ? 0 : Marshal.GetLastWin32Error();
-        if (settings.Fallback is FallbackMode.ScrollLock or FallbackMode.MousePixel)
+            bool result = fallback switch
+            {
+                FallbackMode.None => true,
+                FallbackMode.ScrollLock => NativeMethods.ToggleScrollLockTwice(),
+                FallbackMode.MousePixel => NativeMethods.NudgeMouseOnePixel(),
+                FallbackMode.CpuFloor => cpuFloor?.Activate() == true,
+                _ => false
+            };
+
+            if (result)
+            {
+                fallbackResults.Add($"{fallback}:ok");
+                continue;
+            }
+
+            fallbackOk = false;
+            fallbackResults.Add(fallback == FallbackMode.CpuFloor
+                ? $"{fallback}:failed (see previous log entry)"
+                : $"{fallback}:failed (Win32 error={Marshal.GetLastWin32Error()})");
+        }
+
+        if (hasInputFallback)
             Thread.Sleep(50);
-        TimeSpan? localInputIdleAfter = NativeMethods.TryGetLastInputIdle(out int inputAfterError);
+        int inputAfterError = 0;
+        TimeSpan? localInputIdleAfter = hasInputFallback
+            ? NativeMethods.TryGetLastInputIdle(out inputAfterError)
+            : null;
 
         string executionStateResult = executionStateOk ? "ok" : $"failed (Win32 error={executionStateError})";
-        string fallbackResult = settings.Fallback == FallbackMode.None
-            ? "disabled"
-            : fallbackOk ? "ok" : settings.Fallback == FallbackMode.CpuFloor
-                ? "failed (see previous log entry)"
-                : $"failed (Win32 error={fallbackError})";
-        string localInputResult = localInputIdleBefore.HasValue && localInputIdleAfter.HasValue
+        string fallbackResult = string.Join(",", fallbackResults);
+        string localInputResult = !hasInputFallback
+            ? "not-requested"
+            : localInputIdleBefore.HasValue && localInputIdleAfter.HasValue
             ? $"{localInputIdleBefore.Value.TotalSeconds:F1}s->{localInputIdleAfter.Value.TotalSeconds:F1}s"
             : $"unavailable (Win32 error={(localInputIdleBefore.HasValue ? inputAfterError : inputBeforeError)})";
-        string message = $"Keep-alive attempted after CPU stayed below threshold for {lowFor.TotalSeconds:F0}s (CPU={cpuPercent:F1}%). SetThreadExecutionState={executionStateResult}, fallback={settings.Fallback}:{fallbackResult}, localInputIdle={localInputResult}.";
+        string message = $"Keep-alive attempted after CPU stayed below threshold for {lowFor.TotalSeconds:F0}s (CPU={cpuPercent:F1}%). SetThreadExecutionState={executionStateResult}, fallbacks={fallbackResult}, localInputIdle={localInputResult}.";
         if (executionStateOk && fallbackOk)
             logger.Info(message);
         else
@@ -172,7 +199,8 @@ internal sealed class GuardSettings
     public double CpuThresholdPercent { get; init; } = 10.0;
     public int LowCpuDurationSeconds { get; init; } = 60;
     public int CheckIntervalSeconds { get; init; } = 5;
-    public FallbackMode Fallback { get; init; } = FallbackMode.None;
+    public FallbackMode? Fallback { get; init; }
+    public FallbackMode[]? Fallbacks { get; init; }
     public string LogFile { get; init; } = "logs/VmSessionGuard.log";
     public bool LogCpuSamples { get; init; } = false;
 
@@ -193,6 +221,13 @@ internal sealed class GuardSettings
             ?? throw new InvalidDataException("Configuration is empty.");
         settings.Validate();
         return settings;
+    }
+
+    public IReadOnlyList<FallbackMode> GetFallbackModes()
+    {
+        if (Fallbacks is not null)
+            return Fallbacks;
+        return Fallback.HasValue ? [Fallback.Value] : [FallbackMode.None];
     }
 
     public string ResolveLogPath(DateTimeOffset startedAt)
@@ -216,10 +251,18 @@ internal sealed class GuardSettings
             throw new InvalidDataException("CheckIntervalSeconds must be between 1 and 3600.");
         if (string.IsNullOrWhiteSpace(LogFile))
             throw new InvalidDataException("LogFile must not be empty.");
-        if (!Enum.IsDefined(Fallback))
-            throw new InvalidDataException("Fallback must be None, ScrollLock, MousePixel, or CpuFloor.");
-        if (Fallback == FallbackMode.CpuFloor && CpuThresholdPercent is < 1 or > 25)
-            throw new InvalidDataException("CpuThresholdPercent must be between 1 and 25 when Fallback is CpuFloor.");
+        if (Fallback.HasValue && Fallbacks is not null)
+            throw new InvalidDataException("Specify either Fallback or Fallbacks, not both.");
+
+        IReadOnlyList<FallbackMode> fallbackModes = GetFallbackModes();
+        if (fallbackModes.Count == 0)
+            throw new InvalidDataException("Fallbacks must contain at least one mode.");
+        if (fallbackModes.Any(mode => !Enum.IsDefined(mode)))
+            throw new InvalidDataException("Fallbacks must contain only None, ScrollLock, MousePixel, or CpuFloor.");
+        if (fallbackModes.Count > 1 && fallbackModes.Contains(FallbackMode.None))
+            throw new InvalidDataException("Fallbacks cannot combine None with another mode.");
+        if (fallbackModes.Contains(FallbackMode.CpuFloor) && CpuThresholdPercent is < 1 or > 25)
+            throw new InvalidDataException("CpuThresholdPercent must be between 1 and 25 when Fallbacks includes CpuFloor.");
     }
 }
 

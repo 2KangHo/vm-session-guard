@@ -1,6 +1,6 @@
 # Build verification
 
-- Version: 1.2.0
+- Version: 1.3.0
 - Verification date: 2026-08-03
 - Build host: macOS arm64
 - SDK: .NET SDK 8.0.423 (official `dotnet-install.sh`)
@@ -14,7 +14,8 @@
 4. External NuGet dependencies: **none**; project uses only the .NET shared framework and Windows `kernel32.dll`/`user32.dll` APIs.
 5. Static review:
    - CPU calculation uses deltas from two successful `GetSystemTimes` samples.
-   - Threshold, duration, interval, fallback enum, and log path are range/format validated.
+   - Threshold, duration, interval, fallback list, and log path are range/format validated.
+   - `Fallbacks` can run `CpuFloor` together with `MousePixel` or `ScrollLock`; legacy single `Fallback` remains supported.
    - The distributed configuration uses `MousePixel` to refresh input-based VM/VDI idle policies; `None` remains available for environments where synthetic input is not approved.
    - Scroll Lock fallback sends two complete key down/up cycles.
    - Mouse fallback sends +1 then -1 relative motion.
