@@ -2,7 +2,7 @@
   "CpuThresholdPercent": 10.0,
   "LowCpuDurationSeconds": 60,
   "CheckIntervalSeconds": 5,
-  "Fallback": "None",
+  "Fallback": "MousePixel",
   "LogFile": "logs/VmSessionGuard.log",
   "LogCpuSamples": false
 }

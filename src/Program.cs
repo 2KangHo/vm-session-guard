@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Globalization;
 using System.Runtime.InteropServices;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -8,6 +9,7 @@ namespace VmSessionGuard;
 internal static class Program
 {
     private const string AppName = "VM Session Guard";
+    private const string AppVersion = "1.2.0";
 
     private static int Main(string[] args)
     {
@@ -27,7 +29,9 @@ internal static class Program
         {
             string configPath = GetConfigPath(args);
             GuardSettings settings = GuardSettings.Load(configPath);
-            using var logger = new FileLogger(settings.ResolveLogPath());
+            DateTimeOffset startedAt = DateTimeOffset.Now;
+            string logPath = settings.ResolveLogPath(startedAt);
+            using var logger = new FileLogger(logPath);
             using var stop = new ManualResetEventSlim(false);
 
             Console.CancelKeyPress += (_, eventArgs) =>
@@ -36,11 +40,13 @@ internal static class Program
                 stop.Set();
             };
 
-            Console.WriteLine($"{AppName} 1.1.0");
+            Console.WriteLine($"{AppName} {AppVersion}");
             Console.WriteLine($"Config: {Path.GetFullPath(configPath)}");
-            Console.WriteLine($"Log:    {settings.ResolveLogPath()}");
+            Console.WriteLine($"Log:    {logPath}");
             Console.WriteLine("Press Ctrl+C to stop.");
             logger.Info($"Started. threshold={settings.CpuThresholdPercent:F1}%, duration={settings.LowCpuDurationSeconds}s, interval={settings.CheckIntervalSeconds}s, fallback={settings.Fallback}");
+            if (settings.Fallback == FallbackMode.None)
+                logger.Warn("Fallback=None only refreshes the local Windows execution state; VM/VDI server-side idle policies may still classify this session as idle. Use an approved input fallback such as MousePixel or ScrollLock.");
 
             var sampler = new CpuSampler();
             using CpuFloorController? cpuFloor = settings.Fallback == FallbackMode.CpuFloor
@@ -100,6 +106,7 @@ internal static class Program
             NativeMethods.ExecutionState.SystemRequired |
             NativeMethods.ExecutionState.DisplayRequired) != 0;
         int executionStateError = executionStateOk ? 0 : Marshal.GetLastWin32Error();
+        TimeSpan? localInputIdleBefore = NativeMethods.TryGetLastInputIdle(out int inputBeforeError);
 
         bool fallbackOk = settings.Fallback switch
         {
@@ -110,6 +117,9 @@ internal static class Program
             _ => false
         };
         int fallbackError = fallbackOk || settings.Fallback == FallbackMode.CpuFloor ? 0 : Marshal.GetLastWin32Error();
+        if (settings.Fallback is FallbackMode.ScrollLock or FallbackMode.MousePixel)
+            Thread.Sleep(50);
+        TimeSpan? localInputIdleAfter = NativeMethods.TryGetLastInputIdle(out int inputAfterError);
 
         string executionStateResult = executionStateOk ? "ok" : $"failed (Win32 error={executionStateError})";
         string fallbackResult = settings.Fallback == FallbackMode.None
@@ -117,7 +127,10 @@ internal static class Program
             : fallbackOk ? "ok" : settings.Fallback == FallbackMode.CpuFloor
                 ? "failed (see previous log entry)"
                 : $"failed (Win32 error={fallbackError})";
-        string message = $"Keep-alive attempted after CPU stayed below threshold for {lowFor.TotalSeconds:F0}s (CPU={cpuPercent:F1}%). SetThreadExecutionState={executionStateResult}, fallback={settings.Fallback}:{fallbackResult}.";
+        string localInputResult = localInputIdleBefore.HasValue && localInputIdleAfter.HasValue
+            ? $"{localInputIdleBefore.Value.TotalSeconds:F1}s->{localInputIdleAfter.Value.TotalSeconds:F1}s"
+            : $"unavailable (Win32 error={(localInputIdleBefore.HasValue ? inputAfterError : inputBeforeError)})";
+        string message = $"Keep-alive attempted after CPU stayed below threshold for {lowFor.TotalSeconds:F0}s (CPU={cpuPercent:F1}%). SetThreadExecutionState={executionStateResult}, fallback={settings.Fallback}:{fallbackResult}, localInputIdle={localInputResult}.";
         if (executionStateOk && fallbackOk)
             logger.Info(message);
         else
@@ -182,10 +195,15 @@ internal sealed class GuardSettings
         return settings;
     }
 
-    public string ResolveLogPath()
+    public string ResolveLogPath(DateTimeOffset startedAt)
     {
         string path = Environment.ExpandEnvironmentVariables(LogFile);
-        return Path.GetFullPath(Path.IsPathRooted(path) ? path : Path.Combine(AppContext.BaseDirectory, path));
+        string absolutePath = Path.GetFullPath(Path.IsPathRooted(path) ? path : Path.Combine(AppContext.BaseDirectory, path));
+        string? directory = Path.GetDirectoryName(absolutePath);
+        string fileName = Path.GetFileNameWithoutExtension(absolutePath);
+        string extension = Path.GetExtension(absolutePath);
+        string timestamp = startedAt.ToLocalTime().ToString("yyyyMMdd-HHmmss-fff", CultureInfo.InvariantCulture);
+        return Path.Combine(directory ?? AppContext.BaseDirectory, $"{fileName}-{timestamp}-p{Environment.ProcessId}{extension}");
     }
 
     private void Validate()
@@ -321,7 +339,7 @@ internal sealed class FileLogger : IDisposable
     public FileLogger(string path)
     {
         Directory.CreateDirectory(Path.GetDirectoryName(path)!);
-        _writer = new StreamWriter(new FileStream(path, FileMode.Append, FileAccess.Write, FileShare.ReadWrite))
+        _writer = new StreamWriter(new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.Read))
         {
             AutoFlush = true
         };
@@ -424,8 +442,16 @@ internal static class NativeMethods
     private const uint InputMouse = 0;
     private const uint InputKeyboard = 1;
     private const uint MouseMove = 0x0001;
+    private const uint MouseMoveNoCoalesce = 0x2000;
     private const uint KeyUp = 0x0002;
     private const ushort VkScroll = 0x91;
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct LastInputInfo
+    {
+        public uint Size;
+        public uint Time;
+    }
 
     [DllImport("kernel32.dll", SetLastError = true)]
     internal static extern bool GetSystemTimes(out FileTime idleTime, out FileTime kernelTime, out FileTime userTime);
@@ -434,7 +460,25 @@ internal static class NativeMethods
     internal static extern ExecutionState SetThreadExecutionState(ExecutionState esFlags);
 
     [DllImport("user32.dll", SetLastError = true)]
+    private static extern bool GetLastInputInfo(ref LastInputInfo lastInputInfo);
+
+    [DllImport("user32.dll", SetLastError = true)]
     private static extern uint SendInput(uint inputCount, Input[] inputs, int size);
+
+    internal static TimeSpan? TryGetLastInputIdle(out int error)
+    {
+        var lastInputInfo = new LastInputInfo { Size = (uint)Marshal.SizeOf<LastInputInfo>() };
+        if (!GetLastInputInfo(ref lastInputInfo))
+        {
+            error = Marshal.GetLastWin32Error();
+            return null;
+        }
+
+        error = 0;
+        uint currentTick = unchecked((uint)GetTickCount64());
+        uint idleMilliseconds = unchecked(currentTick - lastInputInfo.Time);
+        return TimeSpan.FromMilliseconds(idleMilliseconds);
+    }
 
     internal static bool ToggleScrollLockTwice()
     {
@@ -461,6 +505,9 @@ internal static class NativeMethods
     private static Input Mouse(int dx, int dy) => new()
     {
         Type = InputMouse,
-        Data = new InputUnion { Mouse = new MouseInput { Dx = dx, Dy = dy, Flags = MouseMove } }
+        Data = new InputUnion { Mouse = new MouseInput { Dx = dx, Dy = dy, Flags = MouseMove | MouseMoveNoCoalesce } }
     };
+
+    [DllImport("kernel32.dll")]
+    private static extern ulong GetTickCount64();
 }
