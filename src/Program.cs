@@ -9,7 +9,7 @@ namespace VmSessionGuard;
 internal static class Program
 {
     private const string AppName = "VM Session Guard";
-    private const string AppVersion = "1.3.0";
+    private const string AppVersion = "1.4.0";
 
     private static int Main(string[] args)
     {
@@ -54,6 +54,12 @@ internal static class Program
                 ? new CpuFloorController(settings.CpuThresholdPercent, logger)
                 : null;
             DateTimeOffset? lowSince = null;
+            DateTimeOffset? lastKeepAliveAt = null;
+            if (cpuFloor is not null && settings.StartCpuFloorImmediately)
+            {
+                PerformKeepAlive(fallbackModes, logger, cpuFloor, double.NaN, TimeSpan.Zero);
+                lastKeepAliveAt = startedAt;
+            }
 
             while (!stop.Wait(TimeSpan.FromSeconds(settings.CheckIntervalSeconds)))
             {
@@ -78,6 +84,7 @@ internal static class Program
                     {
                         PerformKeepAlive(fallbackModes, logger, cpuFloor, cpuPercent, lowFor);
                         lowSince = now;
+                        lastKeepAliveAt = now;
                     }
                 }
                 else
@@ -85,6 +92,19 @@ internal static class Program
                     if (lowSince is not null && settings.LogCpuSamples)
                         logger.Info($"CPU recovered to {cpuPercent:F1}%.");
                     lowSince = null;
+
+                    if (cpuFloor?.IsActive == true &&
+                        lastKeepAliveAt is not null &&
+                        (now - lastKeepAliveAt.Value).TotalSeconds >= settings.LowCpuDurationSeconds)
+                    {
+                        PerformKeepAlive(
+                            fallbackModes,
+                            logger,
+                            cpuFloor,
+                            cpuPercent,
+                            TimeSpan.FromSeconds(settings.LowCpuDurationSeconds));
+                        lastKeepAliveAt = now;
+                    }
                 }
 
                 if (settings.LogCpuSamples)
@@ -157,7 +177,8 @@ internal static class Program
             : localInputIdleBefore.HasValue && localInputIdleAfter.HasValue
             ? $"{localInputIdleBefore.Value.TotalSeconds:F1}s->{localInputIdleAfter.Value.TotalSeconds:F1}s"
             : $"unavailable (Win32 error={(localInputIdleBefore.HasValue ? inputAfterError : inputBeforeError)})";
-        string message = $"Keep-alive attempted after CPU stayed below threshold for {lowFor.TotalSeconds:F0}s (CPU={cpuPercent:F1}%). SetThreadExecutionState={executionStateResult}, fallbacks={fallbackResult}, localInputIdle={localInputResult}.";
+        string measuredCpu = double.IsNaN(cpuPercent) ? "unavailable" : $"{cpuPercent:F1}%";
+        string message = $"Keep-alive attempted after CPU stayed below threshold for {lowFor.TotalSeconds:F0}s (CPU={measuredCpu}). SetThreadExecutionState={executionStateResult}, fallbacks={fallbackResult}, localInputIdle={localInputResult}.";
         if (executionStateOk && fallbackOk)
             logger.Info(message);
         else
@@ -199,6 +220,7 @@ internal sealed class GuardSettings
     public double CpuThresholdPercent { get; init; } = 10.0;
     public int LowCpuDurationSeconds { get; init; } = 60;
     public int CheckIntervalSeconds { get; init; } = 5;
+    public bool StartCpuFloorImmediately { get; init; } = true;
     public FallbackMode? Fallback { get; init; }
     public FallbackMode[]? Fallbacks { get; init; }
     public string LogFile { get; init; } = "logs/VmSessionGuard.log";
@@ -275,6 +297,7 @@ internal sealed class CpuFloorController : IDisposable
     private readonly FileLogger _logger;
     private readonly ManualResetEventSlim _stop = new(false);
     private readonly Thread[] _workers;
+    private readonly double _minimumDuty;
     private double _desiredDuty;
     private int _active;
     private DateTimeOffset _nextStatusLog = DateTimeOffset.MinValue;
@@ -284,13 +307,19 @@ internal sealed class CpuFloorController : IDisposable
         _targetPercent = targetPercent;
         _logger = logger;
         int workerCount = Math.Min(Environment.ProcessorCount, MaxWorkers);
+        _minimumDuty = Math.Clamp(
+            (_targetPercent / 100.0) * Environment.ProcessorCount / workerCount,
+            0.0,
+            MaxWorkerDuty);
         _workers = Enumerable.Range(1, workerCount).Select(index => new Thread(WorkerLoop)
         {
             IsBackground = true,
             Name = $"VmSessionGuard.CpuFloor.{index}",
-            Priority = ThreadPriority.BelowNormal
+            Priority = ThreadPriority.Normal
         }).ToArray();
     }
+
+    public bool IsActive => Volatile.Read(ref _active) != 0;
 
     public bool Activate()
     {
@@ -299,22 +328,19 @@ internal sealed class CpuFloorController : IDisposable
 
         try
         {
-            double initialDuty = Math.Clamp(
-                (_targetPercent / 100.0) * Environment.ProcessorCount / _workers.Length,
-                0.0,
-                MaxWorkerDuty);
-            Volatile.Write(ref _desiredDuty, initialDuty);
+            Volatile.Write(ref _desiredDuty, _minimumDuty);
             foreach (Thread worker in _workers)
                 worker.Start();
 
             double maximumSystemContribution = 100.0 * _workers.Length * MaxWorkerDuty / Environment.ProcessorCount;
-            _logger.Warn($"CPU floor activated with {_workers.Length} below-normal-priority workers. target={_targetPercent:F1}%, initial worker duty={initialDuty * 100:F1}%, safety ceiling contribution={maximumSystemContribution:F1}%.");
+            _logger.Warn($"CPU floor activated with {_workers.Length} normal-priority workers. target={_targetPercent:F1}%, minimum worker duty={_minimumDuty * 100:F1}%, safety ceiling contribution={maximumSystemContribution:F1}%.");
             if (maximumSystemContribution < _targetPercent)
                 _logger.Warn($"CPU floor target may be unreachable on this {Environment.ProcessorCount}-processor VM because of the safety ceiling.");
             return true;
         }
         catch (Exception ex)
         {
+            Interlocked.Exchange(ref _active, 0);
             _logger.Error($"Could not activate CPU floor: {ex.Message}");
             _stop.Set();
             return false;
@@ -329,13 +355,13 @@ internal sealed class CpuFloorController : IDisposable
         double currentDuty = Volatile.Read(ref _desiredDuty);
         double processorScale = (double)Environment.ProcessorCount / _workers.Length;
         double adjustment = 0.65 * ((_targetPercent - measuredCpuPercent) / 100.0) * processorScale;
-        double nextDuty = Math.Clamp(currentDuty + adjustment, 0.0, MaxWorkerDuty);
+        double nextDuty = Math.Clamp(currentDuty + adjustment, _minimumDuty, MaxWorkerDuty);
         Volatile.Write(ref _desiredDuty, nextDuty);
 
         DateTimeOffset now = DateTimeOffset.Now;
         if (now >= _nextStatusLog)
         {
-            _logger.Info($"CPU floor status: measured={measuredCpuPercent:F1}%, target={_targetPercent:F1}%, worker duty={nextDuty * 100:F1}%.");
+            _logger.Info($"CPU floor status: measured={measuredCpuPercent:F1}%, target={_targetPercent:F1}%, minimum worker duty={_minimumDuty * 100:F1}%, worker duty={nextDuty * 100:F1}%.");
             _nextStatusLog = now.AddMinutes(1);
         }
     }
@@ -486,8 +512,10 @@ internal static class NativeMethods
     private const uint InputKeyboard = 1;
     private const uint MouseMove = 0x0001;
     private const uint MouseMoveNoCoalesce = 0x2000;
+    private const uint KeyScanCode = 0x0008;
     private const uint KeyUp = 0x0002;
-    private const ushort VkScroll = 0x91;
+    private const ushort ScrollScanCode = 0x46;
+    private const int InputPulseDelayMilliseconds = 75;
 
     [StructLayout(LayoutKind.Sequential)]
     private struct LastInputInfo
@@ -525,24 +553,38 @@ internal static class NativeMethods
 
     internal static bool ToggleScrollLockTwice()
     {
-        Input[] inputs =
-        [
-            Key(VkScroll, 0), Key(VkScroll, KeyUp),
-            Key(VkScroll, 0), Key(VkScroll, KeyUp)
-        ];
-        return SendInput((uint)inputs.Length, inputs, Marshal.SizeOf<Input>()) == inputs.Length;
+        for (int cycle = 0; cycle < 2; cycle++)
+        {
+            if (!SendKey(ScrollScanCode, 0) || !SendKey(ScrollScanCode, KeyUp))
+                return false;
+            Thread.Sleep(InputPulseDelayMilliseconds);
+        }
+
+        return true;
     }
 
     internal static bool NudgeMouseOnePixel()
     {
-        Input[] inputs = [Mouse(1, 0), Mouse(-1, 0)];
-        return SendInput((uint)inputs.Length, inputs, Marshal.SizeOf<Input>()) == inputs.Length;
+        Input[] forward = [Mouse(4, 0)];
+        if (SendInput(1, forward, Marshal.SizeOf<Input>()) != 1)
+            return false;
+
+        Thread.Sleep(InputPulseDelayMilliseconds);
+
+        Input[] backward = [Mouse(-4, 0)];
+        return SendInput(1, backward, Marshal.SizeOf<Input>()) == 1;
     }
 
-    private static Input Key(ushort virtualKey, uint flags) => new()
+    private static bool SendKey(ushort scanCode, uint flags)
+    {
+        Input[] inputs = [Key(scanCode, flags)];
+        return SendInput(1, inputs, Marshal.SizeOf<Input>()) == 1;
+    }
+
+    private static Input Key(ushort scanCode, uint flags) => new()
     {
         Type = InputKeyboard,
-        Data = new InputUnion { Keyboard = new KeyboardInput { VirtualKey = virtualKey, Flags = flags } }
+        Data = new InputUnion { Keyboard = new KeyboardInput { Scan = scanCode, Flags = KeyScanCode | flags } }
     };
 
     private static Input Mouse(int dx, int dy) => new()
