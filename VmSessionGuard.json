@@ -1,5 +1,5 @@
 {
-  "CpuThresholdPercent": 10.0,
+  "CpuThresholdPercent": 12.5,
   "LowCpuDurationSeconds": 60,
   "CheckIntervalSeconds": 5,
   "StartCpuFloorImmediately": true,

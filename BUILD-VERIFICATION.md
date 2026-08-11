@@ -1,6 +1,6 @@
 # Build verification
 
-- Version: 1.4.0
+- Version: 1.4.1
 - Verification date: 2026-08-03
 - Build host: macOS arm64
 - SDK: .NET SDK 8.0.423 (official `dotnet-install.sh`)

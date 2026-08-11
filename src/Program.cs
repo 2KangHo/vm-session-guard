@@ -9,7 +9,7 @@ namespace VmSessionGuard;
 internal static class Program
 {
     private const string AppName = "VM Session Guard";
-    private const string AppVersion = "1.4.0";
+    private const string AppVersion = "1.4.1";
 
     private static int Main(string[] args)
     {
@@ -217,7 +217,7 @@ internal enum FallbackMode
 
 internal sealed class GuardSettings
 {
-    public double CpuThresholdPercent { get; init; } = 10.0;
+    public double CpuThresholdPercent { get; init; } = 12.5;
     public int LowCpuDurationSeconds { get; init; } = 60;
     public int CheckIntervalSeconds { get; init; } = 5;
     public bool StartCpuFloorImmediately { get; init; } = true;

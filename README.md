@@ -1,4 +1,4 @@
-# VM Session Guard 1.4.0
+# VM Session Guard 1.4.1
 
 Windows VM에서 승인된 장시간 작업이 낮은 CPU 사용률 때문에 유휴 세션으로 판정되는 상황을 완화하는 콘솔 유틸리티입니다. 전체 CPU 사용률이 설정 임계값 미만으로 일정 시간 유지될 때 Windows `SetThreadExecutionState`를 한 번 호출해 시스템/디스플레이 유휴 타이머를 갱신합니다. 옵션을 명시한 경우에만 Scroll Lock 두 번 토글 또는 마우스 1픽셀 이동 후 즉시 복귀를 추가로 수행합니다.
 
@@ -38,7 +38,7 @@ Releases 페이지에서 최신 `VM-Session-Guard-*-win-x64.zip`을 받아 압�
 
 ```json
 {
-  "CpuThresholdPercent": 10.0,
+  "CpuThresholdPercent": 12.5,
   "LowCpuDurationSeconds": 60,
   "CheckIntervalSeconds": 5,
   "StartCpuFloorImmediately": true,
@@ -51,7 +51,7 @@ Releases 페이지에서 최신 `VM-Session-Guard-*-win-x64.zip`을 받아 압�
 }
 ```
 
-- `CpuThresholdPercent`: 전체 CPU 임계값, 0–100. 기본 10.
+- `CpuThresholdPercent`: 전체 CPU 임계값, 0–100. 기본 12.5. `CpuFloor` 사용 시 1–25 범위가 허용됩니다.
 - `LowCpuDurationSeconds`: 임계값 미만이 지속되어야 하는 시간, 1–86400초. 기본 60.
 - `CheckIntervalSeconds`: CPU 확인 주기, 1–3600초. 기본 5.
 - `StartCpuFloorImmediately`: `CpuFloor`가 선택된 경우 시작 직후 CPU floor와 입력 fallback을 실행할지 여부. 기본 `true`. `false`이면 낮은 CPU 상태가 `LowCpuDurationSeconds` 동안 지속된 뒤 시작합니다.
@@ -75,7 +75,7 @@ fallback은 `SetThreadExecutionState`만으로 사내 세션 유휴 정책이 �
 
 ```json
 {
-  "CpuThresholdPercent": 10.0,
+  "CpuThresholdPercent": 12.5,
   "LowCpuDurationSeconds": 60,
   "CheckIntervalSeconds": 5,
   "Fallbacks": [
