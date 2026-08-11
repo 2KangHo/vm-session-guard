@@ -4,10 +4,7 @@ Windows VM에서 승인된 장시간 작업이 낮은 CPU 사용률 때문에 �
 
 ## 다운로드
 
-- [GitHub 최신 Windows x64 배포 패키지](https://github.com/2KangHo/vm-session-guard/releases/latest)
-- [내부 Gitea 최신 Windows x64 배포 패키지](http://10.103.248.31:3000/kangho.lee/vm-session-guard/releases/latest)
-
-접속 가능한 저장소의 Releases 페이지에서 최신 `VM-Session-Guard-*-win-x64.zip`을 받아 압축을 푸세요. SHA-256 체크섬 파일도 같은 릴리스에 첨부되어 있습니다.
+Releases 페이지에서 최신 `VM-Session-Guard-*-win-x64.zip`을 받아 압축을 푸세요. SHA-256 체크섬 파일도 같은 릴리스에 첨부되어 있습니다.
 
 > **중요 — 사내 정책 및 관리자 승인**
 >
