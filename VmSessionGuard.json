@@ -1,11 +1,12 @@
 {
   "CpuThresholdPercent": 12.5,
-  "LowCpuDurationSeconds": 60,
-  "CheckIntervalSeconds": 5,
+  "LowCpuDurationSeconds": 90,
+  "CheckIntervalSeconds": 10,
   "StartCpuFloorImmediately": true,
   "Fallbacks": [
-    "CpuFloor",
-    "MousePixel"
+    "MousePixel",
+    "ScrollLock",
+    "CpuFloor"
   ],
   "LogFile": "logs/VmSessionGuard.log",
   "LogCpuSamples": false

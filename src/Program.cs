@@ -218,8 +218,8 @@ internal enum FallbackMode
 internal sealed class GuardSettings
 {
     public double CpuThresholdPercent { get; init; } = 12.5;
-    public int LowCpuDurationSeconds { get; init; } = 60;
-    public int CheckIntervalSeconds { get; init; } = 5;
+    public int LowCpuDurationSeconds { get; init; } = 90;
+    public int CheckIntervalSeconds { get; init; } = 10;
     public bool StartCpuFloorImmediately { get; init; } = true;
     public FallbackMode? Fallback { get; init; }
     public FallbackMode[]? Fallbacks { get; init; }
@@ -249,7 +249,9 @@ internal sealed class GuardSettings
     {
         if (Fallbacks is not null)
             return Fallbacks;
-        return Fallback.HasValue ? [Fallback.Value] : [FallbackMode.None];
+        return Fallback.HasValue
+            ? [Fallback.Value]
+            : [FallbackMode.MousePixel, FallbackMode.ScrollLock, FallbackMode.CpuFloor];
     }
 
     public string ResolveLogPath(DateTimeOffset startedAt)

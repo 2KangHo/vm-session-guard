@@ -18,7 +18,7 @@
    - `Fallbacks` can run `CpuFloor` together with `MousePixel` or `ScrollLock`; legacy single `Fallback` remains supported.
    - CPU floor can start immediately, uses normal-priority workers, and enforces a minimum worker duty corresponding to the configured target.
    - Mouse and keyboard pulses use spaced `SendInput` calls with no-coalesce mouse movement and keyboard scan codes.
-   - The distributed configuration uses `MousePixel` to refresh input-based VM/VDI idle policies; `None` remains available for environments where synthetic input is not approved.
+   - The distributed configuration uses `MousePixel`, `ScrollLock`, and `CpuFloor`; `None` remains available for environments where synthetic input is not approved.
    - Scroll Lock fallback sends two complete key down/up cycles.
    - Mouse fallback sends +1 then -1 relative motion.
    - `SetThreadExecutionState` and optional fallback results are logged independently.

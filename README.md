@@ -39,12 +39,13 @@ Releases 페이지에서 최신 `VM-Session-Guard-*-win-x64.zip`을 받아 압�
 ```json
 {
   "CpuThresholdPercent": 12.5,
-  "LowCpuDurationSeconds": 60,
-  "CheckIntervalSeconds": 5,
+  "LowCpuDurationSeconds": 90,
+  "CheckIntervalSeconds": 10,
   "StartCpuFloorImmediately": true,
   "Fallbacks": [
-    "CpuFloor",
-    "MousePixel"
+    "MousePixel",
+    "ScrollLock",
+    "CpuFloor"
   ],
   "LogFile": "logs/VmSessionGuard.log",
   "LogCpuSamples": false
@@ -52,10 +53,10 @@ Releases 페이지에서 최신 `VM-Session-Guard-*-win-x64.zip`을 받아 압�
 ```
 
 - `CpuThresholdPercent`: 전체 CPU 임계값, 0–100. 기본 12.5. `CpuFloor` 사용 시 1–25 범위가 허용됩니다.
-- `LowCpuDurationSeconds`: 임계값 미만이 지속되어야 하는 시간, 1–86400초. 기본 60.
-- `CheckIntervalSeconds`: CPU 확인 주기, 1–3600초. 기본 5.
+- `LowCpuDurationSeconds`: 임계값 미만이 지속되어야 하는 시간, 1–86400초. 기본 90.
+- `CheckIntervalSeconds`: CPU 확인 주기, 1–3600초. 기본 10.
 - `StartCpuFloorImmediately`: `CpuFloor`가 선택된 경우 시작 직후 CPU floor와 입력 fallback을 실행할지 여부. 기본 `true`. `false`이면 낮은 CPU 상태가 `LowCpuDurationSeconds` 동안 지속된 뒤 시작합니다.
-- `Fallbacks`: `None`, `ScrollLock`, `MousePixel`, `CpuFloor` 중 하나 이상을 배열로 지정합니다. 여러 모드를 지정하면 한 번의 keep-alive에서 배열 순서대로 모두 실행됩니다. 배포 설정의 기본값은 `["CpuFloor", "MousePixel"]`입니다.
+- `Fallbacks`: `None`, `ScrollLock`, `MousePixel`, `CpuFloor` 중 하나 이상을 배열로 지정합니다. 여러 모드를 지정하면 한 번의 keep-alive에서 배열 순서대로 모두 실행됩니다. 배포 설정의 기본값은 `["MousePixel", "ScrollLock", "CpuFloor"]`입니다.
 - `Fallback`: 기존 단일 모드 설정과의 호환을 위해 계속 지원하지만, 새 설정에서는 `Fallbacks`를 사용하세요. `Fallback`과 `Fallbacks`를 동시에 지정할 수 없습니다.
 - `LogFile`: 로그 파일의 기본 이름이며 절대 경로 또는 EXE 기준 상대 경로를 사용할 수 있습니다. 환경 변수(예: `%LOCALAPPDATA%`) 사용 가능. 실행할 때 `-yyyyMMdd-HHmmss-fff-pPID`가 확장자 앞에 붙어 실행마다 새 로그 파일이 생성됩니다.
 - `LogCpuSamples`: 모든 CPU 샘플을 기록할지 여부. 기본 `false`; 디버깅 시에만 `true` 권장.
@@ -76,18 +77,19 @@ fallback은 `SetThreadExecutionState`만으로 사내 세션 유휴 정책이 �
 ```json
 {
   "CpuThresholdPercent": 12.5,
-  "LowCpuDurationSeconds": 60,
-  "CheckIntervalSeconds": 5,
+  "LowCpuDurationSeconds": 90,
+  "CheckIntervalSeconds": 10,
   "Fallbacks": [
-    "CpuFloor",
-    "MousePixel"
+    "MousePixel",
+    "ScrollLock",
+    "CpuFloor"
   ],
   "LogFile": "logs/VmSessionGuard.log",
   "LogCpuSamples": false
 }
 ```
 
-위 예시는 시작 즉시 `CpuFloor`로 CPU 부하를 유지하면서 `MousePixel` 입력을 보내고, 이후에도 설정된 간격으로 입력을 반복하는 조합입니다. `CpuFloor`는 실제 계산 작업이 아니라 CPU 시간을 의도적으로 소비합니다. 각 작업 스레드는 정상 우선순위로 실행되며 최대 duty cycle을 50%로 제한합니다. 프로세서를 최대 32개까지만 사용하므로 논리 프로세서가 매우 많은 VM에서는 목표에 도달하지 못할 수 있으며 이 경우 로그에 경고합니다. CPU·전력·공유 VM 비용에 영향을 줄 수 있으므로 **IT/보안/인프라 관리자가 명시적으로 승인한 경우에만** 사용하세요.
+위 예시는 시작 즉시 `CpuFloor`로 CPU 부하를 유지하면서 `MousePixel`과 `ScrollLock` 입력을 모두 보내고, 이후에도 90초 간격으로 세 가지 fallback을 반복하는 조합입니다. `CpuFloor`는 실제 계산 작업이 아니라 CPU 시간을 의도적으로 소비합니다. 각 작업 스레드는 정상 우선순위로 실행되며 최대 duty cycle을 50%로 제한합니다. 프로세서를 최대 32개까지만 사용하므로 논리 프로세서가 매우 많은 VM에서는 목표에 도달하지 못할 수 있으며 이 경우 로그에 경고합니다. CPU·전력·공유 VM 비용에 영향을 줄 수 있으므로 **IT/보안/인프라 관리자가 명시적으로 승인한 경우에만** 사용하세요.
 
 ## 로그
 
